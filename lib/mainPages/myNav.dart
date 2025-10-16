@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:get/get.dart';
 import 'package:streamapp/pages/codeTemp.dart';
 import 'package:streamapp/pages/streamingSound.dart';
+import 'package:streamapp/pages/testaudio.dart';
 import '../mainPages/homePage.dart';
 import '../auth/AppUser.dart';
 import '../auth/loginPage.dart';
@@ -43,6 +44,32 @@ class _myNavState extends State<myNav> {
   Widget build(BuildContext context) {
     List<Map<String, dynamic>> _navigationButtons = [
       {
+        'label': 'Gemeni DB',
+        "imageSource":
+            'asset', // check myImage to know how to send source and path
+        'imagePath': 'icons/contractclient.png',
+        'imageHeight': 24,
+        'imageWidth': 24,
+        'needLogin': false,
+        'targetPage':
+            GeminiLiveDuplexPage(), // send targetpage to change mynav body or send null here and specify function of click action
+        'clickaction': null,
+        'activeColor': myMainColor,
+        'activeImagePath': 'icons/activehome.png',
+      },
+      {
+        'label': "Voice Assistant2",
+        "imageSource": 'asset',
+        'imagePath': 'icons/contractclient.png', // Add a microphone icon
+        'imageHeight': 24,
+        'imageWidth': 24,
+        'needLogin': false, // Set to true if login is required
+        'targetPage': StreamingSoundScreen(),
+        'clickaction': null,
+        'activeColor': myMainColor,
+        'activeImagePath': 'icons/activehome.png',
+      },
+      {
         'label': "home".tr,
         "imageSource":
             'asset', // check myImage to know how to send source and path
@@ -70,20 +97,7 @@ class _myNavState extends State<myNav> {
         'activeColor': myMainColor,
         'activeImagePath': 'icons/activehome.png',
       },
-      {
-        'label': 'Post API',
-        "imageSource":
-            'asset', // check myImage to know how to send source and path
-        'imagePath': 'icons/contractclient.png',
-        'imageHeight': 24,
-        'imageWidth': 24,
-        'needLogin': false,
-        'targetPage':
-            postSamplePage(), // send targetpage to change mynav body or send null here and specify function of click action
-        'clickaction': null,
-        'activeColor': myMainColor,
-        'activeImagePath': 'icons/activehome.png',
-      },
+
       {
         'label': "Voice Assistant",
         "imageSource": 'asset',
@@ -92,18 +106,6 @@ class _myNavState extends State<myNav> {
         'imageWidth': 24,
         'needLogin': false, // Set to true if login is required
         'targetPage': LiveAgentScreen(),
-        'clickaction': null,
-        'activeColor': myMainColor,
-        'activeImagePath': 'icons/activehome.png',
-      },
-      {
-        'label': "Voice Assistant2",
-        "imageSource": 'asset',
-        'imagePath': 'icons/contractclient.png', // Add a microphone icon
-        'imageHeight': 24,
-        'imageWidth': 24,
-        'needLogin': false, // Set to true if login is required
-        'targetPage': StreamingSoundScreen(),
         'clickaction': null,
         'activeColor': myMainColor,
         'activeImagePath': 'icons/activehome.png',

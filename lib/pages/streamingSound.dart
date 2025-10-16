@@ -1,12 +1,11 @@
 import 'dart:async';
 import 'dart:typed_data';
-import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:flutter_audio_capture/flutter_audio_capture.dart';
 import 'package:just_audio/just_audio.dart' as ja;
-// أبقيناه لكن TTS معطّل كلياً
+// TTS موجود لكن معطّل
 import 'package:flutter_tts/flutter_tts.dart';
 
 class StreamingSoundScreen extends StatefulWidget {
@@ -31,86 +30,103 @@ class _StreamingSoundScreenState extends State<StreamingSoundScreen> {
   bool _isRecording = false;
   bool _isStartInProgress = false;
   bool _isStopInProgress = false;
+  bool _allowMicStream = false; // يمنع أي تدفّق بعد Stop
 
-  /// يمنع أي بيانات ميك بعد الإيقاف
-  bool _allowMicStream = false;
-
-  // Playback
+  // Playback pipeline
   final ja.AudioPlayer _player = ja.AudioPlayer();
   late final StreamSubscription _playerSub;
-
-  /// قائمة تشغيل ديناميكية لتخفيف التقطيع
   late final ja.ConcatenatingAudioSource _playlist;
 
-  /// نجمع PCM من السيرفر (24kHz/16bit/mono) قبل تحويله لـ WAV chunk
+  // جِتّر بافر (تجميع PCM ذكي لتقليل التقطيع)
   final BytesBuilder _pcmBuffer = BytesBuilder();
   int _pcmBufferedBytes = 0;
+  bool _firstChunkFlushed = false;
+  Timer? _pcmFlushTimer;
 
-  /// حجم دفعة التجميع (ميلي ثانية)
-  static const int _minChunkMs = 400; // ~0.4 ثانية لتقليل التقطيع
+  // سرعة الاستجابة مقابل السلاسة
+  static const int _firstChunkMs = 90; // لتقليل التأخير الأولي
+  static const int _nextChunkMs = 220; // لتقليل عدد القطع بعد التشغيل
   static const int serverOutSampleRate = 24000;
   static const int serverOutNumChannels = 1;
   static const int serverOutBitsPerSample = 16;
   static const int _bytesPerSample = serverOutBitsPerSample ~/ 8; // 2
   static int get _bytesPerMs =>
       (serverOutSampleRate * serverOutNumChannels * _bytesPerSample) ~/ 1000;
-  int get _minChunkBytes => _bytesPerMs * _minChunkMs;
+  int get _firstChunkBytes => _bytesPerMs * _firstChunkMs;
+  int get _nextChunkBytes => _bytesPerMs * _nextChunkMs;
 
-  bool _isPlaylistAttached = false;
-
-  // سياسة الردود
-  bool _oneShotResponse = true; // أول رد فقط بعد كل تسجيل
-  bool _awaitingResponse = false; // نفعّلها بمجرد ما نوقف التسجيل
-  bool _lockedUntilNextRecording = false; // بعد أول رد، نتجاهل أي ردود لاحقة
+  // سياسة الرد
+  bool _oneShotResponse = true;
+  bool _awaitingResponse = false;
+  bool _lockedUntilNextRecording = false;
+  bool _gotFirstAudioThisTurn = false;
+  Timer? _responseGuardTimer;
+  Timer? _textGuardTimer;
+  static const int _maxTurnTextMs = 2500; // لو السيرفر يرد نص فقط
+  static const int _maxTurnAudioMs = 8000000000; // أقصى زمن مسموح لرد الصوت
 
   // TTS (معطّل)
   final FlutterTts _tts = FlutterTts();
-  final List<String> _ttsQueue = [];
-  bool _isTtsSpeaking = false;
-  bool _ttsAvailable = false;
 
-  // Store recorded audio for optional playback
+  // Recorded uplink (اختياري للـ playback)
   final List<Uint8List> _recordedAudioBuffer = [];
   bool _showPlaybackButton = false;
 
-  // Audio level monitoring
+  // Audio level UI
   double _currentAudioLevel = 0.0;
   Timer? _audioLevelTimer;
 
   final List<String> _messages = [];
 
-  // Voice I/O (uplink to server)
+  // Uplink format
   static const int inputSampleRate = 16000;
   static const int inputNumChannels = 1;
 
   @override
   void initState() {
     super.initState();
+
     _playlist = ja.ConcatenatingAudioSource(children: []);
-    _initializeAudioCapture();
-
-    _playerSub = _player.playerStateStream.listen((st) async {
-      // ما منعمل stop ولا reset للّست حتى ما يصير تقطيع
-      // لما يخلص عنصر، just_audio لحاله بيكمل على التالي
-    });
-
-    _configureTts(); // يبقى معطّل
+    _initAudio();
   }
 
-  Future<void> _initializeAudioCapture() async {
+  Future<void> _initAudio() async {
     try {
       await _audioCapture.init();
+
+      // اربط البلاي ليست مرة وحدة من البداية لتجنب أي تقطيع/تأخير
+      await _player.setAudioSource(_playlist);
       await _player.setVolume(1.0);
       await _player.setSpeed(1.0);
+
+      // كروس فيد خفيف لطمس الفراغ بين القطع
+      // Crossfade skipped (not available on this just_audio version)
+
+      _playerSub = _player.playerStateStream.listen((st) async {
+        // لما يفضى البلاي ليست ونكون خارج التسجيل، نقفل الدور نهائيًا
+        if (st.processingState == ja.ProcessingState.completed ||
+            (st.processingState == ja.ProcessingState.idle &&
+                !_isRecording &&
+                _playlist.length == 0)) {
+          _finalizeTurnIfNeeded();
+        }
+      });
     } catch (e) {
-      setState(() => _messages.add('System: Failed to initialize audio: $e'));
+      setState(() => _messages.add('System: Failed to init audio: $e'));
+      // حتى لو فشل init، أمنع الكراش على dispose
+      _playerSub = const Stream.empty().listen((_) {});
     }
+
+    // عطّل أي TTS
+    _configureTts();
   }
 
   @override
   void dispose() {
     _stopKeepAlive();
     _reconnectTimer?.cancel();
+    _responseGuardTimer?.cancel();
+    _textGuardTimer?.cancel();
     _playerSub.cancel();
     _player.dispose();
     _audioLevelTimer?.cancel();
@@ -141,7 +157,8 @@ class _StreamingSoundScreenState extends State<StreamingSoundScreen> {
         onError: (e) => _onDisconnected('Connection Error: $e'),
       );
 
-      _startKeepAlive();
+      // عطّل keep-alive لأن بعض السيرفرات تتعامل مع "ping" كرد
+      // _startKeepAlive();
       _reconnectAttempts = 0;
     } catch (e) {
       _onDisconnected('Connection Failed: $e');
@@ -186,47 +203,29 @@ class _StreamingSoundScreenState extends State<StreamingSoundScreen> {
     });
   }
 
-  void _startKeepAlive() {
-    _keepAliveTimer?.cancel();
-    _keepAliveTimer = Timer.periodic(const Duration(seconds: 25), (_) {
-      if (_isConnected && _channel != null) {
-        try {
-          _channel!.sink.add('ping');
-        } catch (_) {}
-      }
-    });
-  }
-
   void _stopKeepAlive() {
     _keepAliveTimer?.cancel();
     _keepAliveTimer = null;
   }
 
-  // --------------- Incoming from server ---------------
+  // ---------------- Incoming ----------------
   void _onServerData(dynamic data) {
-    // لو كنا قافلين الردود لحد التسجيل القادم، تجاهل
+    // لو الدور مقفول، تجاهل كل شيء لحد التسجيل القادم
     if (_lockedUntilNextRecording) return;
 
     if (data is String) {
-      // نعكس النص بالـ UI فقط (بدون TTS)
-      if (!_awaitingResponse && _oneShotResponse) {
-        // تجاهل أي نص stray خارج نافذة الرد
-        return;
-      }
+      // عرض نص فقط أثناء نافذة الرد
+      if (!_awaitingResponse && _oneShotResponse) return;
       setState(() => _messages.add('AI: $data'));
+      // فعّل حارس النص لو ما فيش صوت
+      _startTextGuard();
       return;
     }
 
-    // Binary audio
     if (data is Uint8List || data is List<int> || data is ByteBuffer) {
-      if (!_awaitingResponse && _oneShotResponse) {
-        // إذا مو بوضع انتظار رد (دور جديد)، تجاهل التشانكس
-        return;
-      }
+      if (!_awaitingResponse && _oneShotResponse) return;
 
       _safeTtsStop();
-      _isTtsSpeaking = false;
-      _ttsQueue.clear();
 
       Uint8List bytes;
       if (data is Uint8List) {
@@ -237,42 +236,64 @@ class _StreamingSoundScreenState extends State<StreamingSoundScreen> {
         bytes = (data as ByteBuffer).asUint8List();
       }
 
-      // هل هو WAV جاهز؟
-      final bool isWav = _isWavData(bytes);
-
-      if (isWav) {
-        // مباشرة نضيفه لليسيت
-        _enqueueWav(bytes);
-      } else {
-        // RAW PCM -> نجمعه في الجِتّر بافر
-        _enqueuePcm(bytes);
+      // أول باكيت صوت = بداية الرد
+      if (!_gotFirstAudioThisTurn) {
+        _gotFirstAudioThisTurn = true;
+        _startResponseGuard(); // حارس زمن أقصى للرد
+        // أول حزمة صوت = flush أسرع
+        _firstChunkFlushed = false;
       }
 
-      // أول باكيت صوت يعتبر “رد” لهذا الدور:
-      if (_oneShotResponse) {
-        _awaitingResponse = false;
-        _lockedUntilNextRecording = true; // امنع أي ردود لاحقة
+      if (_isWavData(bytes)) {
+        _enqueueWav(bytes);
+      } else {
+        _enqueuePcm(bytes);
       }
       return;
     }
 
-    // Unknown
     setState(() => _messages.add('System: Unknown data from server'));
   }
 
-  // --------------- One-shot reply gating ---------------
+  // ---------------- Turn gating ----------------
   void _openTurnForReply() {
-    // نسمح برد واحد من السيرفر بعد كل تسجيل
     _awaitingResponse = true;
     _lockedUntilNextRecording = false;
+    _gotFirstAudioThisTurn = false;
+    _responseGuardTimer?.cancel();
   }
 
-  void _resetTurn() {
-    _awaitingResponse = false;
-    _lockedUntilNextRecording = false;
+  void _startResponseGuard() {
+    _responseGuardTimer?.cancel();
+    _responseGuardTimer = Timer(
+      const Duration(milliseconds: _maxTurnAudioMs),
+      () {
+        _finalizeTurnIfNeeded();
+      },
+    );
   }
 
-  // --------------- Outgoing to server ---------------
+  void _startTextGuard() {
+    _textGuardTimer?.cancel();
+    _textGuardTimer = Timer(const Duration(milliseconds: _maxTurnTextMs), () {
+      _finalizeTurnIfNeeded();
+    });
+  }
+
+  void _finalizeTurnIfNeeded() {
+    if (_oneShotResponse) {
+      _awaitingResponse = false;
+      _lockedUntilNextRecording = true; // امنع أي ذيول من السيرفر
+    }
+    _responseGuardTimer?.cancel();
+    _responseGuardTimer = null;
+    _textGuardTimer?.cancel();
+    _textGuardTimer = null;
+  }
+
+  // resetTurn removed; gating handled by guards
+
+  // ---------------- Outgoing ----------------
   void _sendText(String text) {
     if (!_isConnected || text.trim().isEmpty) return;
     _channel!.sink.add(text);
@@ -280,11 +301,10 @@ class _StreamingSoundScreenState extends State<StreamingSoundScreen> {
       _messages.add('User (Text): $text');
       _inputController.clear();
     });
-    // لو بدك one-shot كمان للنصوص، افتح نافذة رد
     if (_oneShotResponse) _openTurnForReply();
   }
 
-  // --------------- Capture mic ---------------
+  // ---------------- Mic ----------------
   Future<void> _toggleRecording() async {
     if (!_isConnected) return;
     if (_isStartInProgress || _isStopInProgress) return;
@@ -323,12 +343,9 @@ class _StreamingSoundScreenState extends State<StreamingSoundScreen> {
       );
 
       await _safeTtsStop();
-      _isTtsSpeaking = false;
-      _ttsQueue.clear();
 
       setState(() {
         _isRecording = true;
-        // _messages.add('User (Voice): Recording started…');
       });
 
       _audioLevelTimer?.cancel();
@@ -339,6 +356,11 @@ class _StreamingSoundScreenState extends State<StreamingSoundScreen> {
           setState(() {});
         }
       });
+
+      // بمجرد بدء تسجيل جديد، افتح نافذة رد جديدة
+      if (_oneShotResponse) _openTurnForReply();
+      // ابدأ دورة جديدة: أوقف أي تشغيل سابق وافرغ البافرات حتى لا يتداخل الصوت
+      _resetPlaybackPipeline();
     } catch (e) {
       setState(() {
         _isRecording = false;
@@ -358,25 +380,32 @@ class _StreamingSoundScreenState extends State<StreamingSoundScreen> {
       await _audioCapture.stop().timeout(const Duration(seconds: 2));
     } catch (_) {}
 
-    // افتح نافذة رد مباشرة ليصلك أول رد “فوراً”
-    _openTurnForReply();
-
-    // إشارة نهاية الدور — أقوى/أوضح من space:
+    // إشارة نهاية الدور — فقط END_OF_TURN (بدون \n لتجنّب prompts إضافية)
     try {
-      _channel?.sink.add('END_OF_TURN'); // Text sentinel
-      // (اختياري) لو سيرفرك يتوقع JSON:
-      // _channel?.sink.add('{"event":"end_of_utterance"}');
-      // (اختياري) سطر جديد:
-      _channel?.sink.add('\n');
+      _channel?.sink.add('END_OF_TURN');
     } catch (_) {}
 
     setState(() {
       _isRecording = false;
       _currentAudioLevel = 0.0;
       _showPlaybackButton = _recordedAudioBuffer.isNotEmpty;
-      // _messages.add('User (Voice): Recording stopped.');
     });
     _audioLevelTimer?.cancel();
+
+    // بعد التوقف مباشرةً، ابدأ تشغيل الصوت القادم من السيرفر إن وجد
+    try {
+      if (_playlist.length > 0) {
+        final newIndex = _playlist.length - 1;
+        if (_player.processingState == ja.ProcessingState.completed ||
+            _player.currentIndex == null ||
+            (_player.currentIndex ?? -1) != newIndex) {
+          await _player.seek(Duration.zero, index: newIndex);
+        }
+        if (!_player.playing) {
+          await _player.play();
+        }
+      }
+    } catch (_) {}
 
     _isStopInProgress = false;
   }
@@ -402,7 +431,7 @@ class _StreamingSoundScreenState extends State<StreamingSoundScreen> {
 
     setState(() => _currentAudioLevel = maxAmplitude);
 
-    // Boost بسيط للصوت الخافت
+    // Boost بسيط
     Float32List processedData = floatData;
     if (maxAmplitude > 0 && maxAmplitude < 0.1) {
       final gainFactor = (0.3 / maxAmplitude).clamp(1.0, 3.0);
@@ -418,32 +447,55 @@ class _StreamingSoundScreenState extends State<StreamingSoundScreen> {
       clamp: true,
     );
 
-    _recordedAudioBuffer.add(chunk); // اختياري لزر Playback
-    _channel?.sink.add(chunk); // أرسل للسيرفر
+    _recordedAudioBuffer.add(chunk); // اختياري
+    _channel?.sink.add(chunk); // uplink
   }
 
   void _onAudioError(Object e) {
     setState(() => _messages.add('System: Capture error: $e'));
   }
 
-  // --------------- Playback pipeline ---------------
+  // ---------------- Playback ----------------
   void _enqueuePcm(Uint8List rawPcm) {
+    // ضيف للباڤر
     _pcmBuffer.add(rawPcm);
     _pcmBufferedBytes += rawPcm.length;
 
-    if (_pcmBufferedBytes >= _minChunkBytes) {
-      final pcmChunk = _pcmBuffer.toBytes();
-      _pcmBuffer.clear();
-      _pcmBufferedBytes = 0;
+    // احسب العتبة الحالية
+    final int threshold = _firstChunkFlushed
+        ? _nextChunkBytes
+        : _firstChunkBytes;
 
-      final wav = _pcmToWav(
-        pcmChunk,
-        sampleRate: serverOutSampleRate,
-        numChannels: serverOutNumChannels,
-        bitsPerSample: serverOutBitsPerSample,
-      );
-      _enqueueWav(wav);
+    // flush فوري لو عدينا العتبة
+    if (_pcmBufferedBytes >= threshold) {
+      _flushPcmBufferToWav();
+      _firstChunkFlushed = true;
+      return;
     }
+
+    // أو جدولة flush سريع لو مفيش باكيتات جديدة
+    _pcmFlushTimer?.cancel();
+    _pcmFlushTimer = Timer(const Duration(milliseconds: 60), () {
+      if (_pcmBufferedBytes > 0) {
+        _flushPcmBufferToWav();
+        _firstChunkFlushed = true;
+      }
+    });
+  }
+
+  void _flushPcmBufferToWav() {
+    if (_pcmBufferedBytes == 0) return;
+    final pcmChunk = _pcmBuffer.toBytes();
+    _pcmBuffer.clear();
+    _pcmBufferedBytes = 0;
+
+    final wav = _pcmToWav(
+      pcmChunk,
+      sampleRate: serverOutSampleRate,
+      numChannels: serverOutNumChannels,
+      bitsPerSample: serverOutBitsPerSample,
+    );
+    _enqueueWav(wav);
   }
 
   void _enqueueWav(Uint8List wavBytes) async {
@@ -451,23 +503,20 @@ class _StreamingSoundScreenState extends State<StreamingSoundScreen> {
       Uri.dataFromBytes(wavBytes, mimeType: 'audio/wav'),
     );
 
-    // اربط البلاي ليست أول مرة فقط
-    if (!_isPlaylistAttached) {
-      try {
-        await _player.setAudioSource(_playlist);
-        _isPlaylistAttached = true;
-      } catch (_) {}
-    }
-
-    // أضف القطعة للقائمة
     try {
       await _playlist.add(source);
     } catch (_) {}
-
-    // ابدأ تشغيل إن ما كان شغّال
-    if (_player.playing == false) {
+    if (!_isRecording) {
       try {
-        await _player.play();
+        final newIndex = _playlist.length - 1;
+        if (_player.processingState == ja.ProcessingState.completed ||
+            _player.currentIndex == null ||
+            (_player.currentIndex ?? -1) != newIndex) {
+          await _player.seek(Duration.zero, index: newIndex);
+        }
+        if (!_player.playing) {
+          await _player.play();
+        }
       } catch (_) {}
     }
   }
@@ -475,29 +524,28 @@ class _StreamingSoundScreenState extends State<StreamingSoundScreen> {
   void _resetPlaybackPipeline() {
     _player.stop();
     _playlist.clear();
-    _isPlaylistAttached = false;
     _pcmBuffer.clear();
     _pcmBufferedBytes = 0;
+    _pcmFlushTimer?.cancel();
+    _pcmFlushTimer = null;
+    _firstChunkFlushed = false;
   }
 
-  // --------------- Helpers: Formats ---------------
+  // ---------------- Helpers ----------------
   bool _isWavData(Uint8List data) {
     if (data.length < 12) return false;
-    return data[0] == 0x52 && // R
-        data[1] == 0x49 && // I
-        data[2] == 0x46 && // F
-        data[3] == 0x46 && // F
-        data[8] == 0x57 && // W
-        data[9] == 0x41 && // A
-        data[10] == 0x56 && // V
-        data[11] == 0x45; // E
+    return data[0] == 0x52 &&
+        data[1] == 0x49 &&
+        data[2] == 0x46 &&
+        data[3] == 0x46 &&
+        data[8] == 0x57 &&
+        data[9] == 0x41 &&
+        data[10] == 0x56 &&
+        data[11] == 0x45;
   }
 
-  // --------------- TTS helpers (disabled) ---------------
   Future<void> _configureTts() async {
-    _ttsAvailable = false;
     await _safeTtsStop();
-    _ttsQueue.clear();
   }
 
   Future<void> _safeTtsStop() async {
@@ -506,7 +554,6 @@ class _StreamingSoundScreenState extends State<StreamingSoundScreen> {
     } catch (_) {}
   }
 
-  // --------------- Conversions ---------------
   Uint8List _float32ToPCM16(
     Float32List floats, {
     int numChannels = 1,
@@ -543,8 +590,8 @@ class _StreamingSoundScreenState extends State<StreamingSoundScreen> {
     header.add(_le32(fileSize));
     header.add([0x57, 0x41, 0x56, 0x45]); // WAVE
     header.add([0x66, 0x6d, 0x74, 0x20]); // fmt
-    header.add(_le32(16)); // PCM chunk size
-    header.add(_le16(1)); // PCM format
+    header.add(_le32(16));
+    header.add(_le16(1));
     header.add(_le16(numChannels));
     header.add(_le32(sampleRate));
     header.add(_le32(byteRate));
@@ -564,7 +611,7 @@ class _StreamingSoundScreenState extends State<StreamingSoundScreen> {
     (v >> 24) & 0xff,
   ];
 
-  // ---------------- Optional: play recorded uplink ----------------
+  // ---------------- Optional: play uplink ----------------
   Future<void> _playRecordedAudio() async {
     if (_recordedAudioBuffer.isEmpty) {
       setState(() => _messages.add('System: No recorded audio to play'));
@@ -582,7 +629,6 @@ class _StreamingSoundScreenState extends State<StreamingSoundScreen> {
         bitsPerSample: 16,
       );
 
-      // تشغيل مستقل عن البلاي ليست الأساسية
       await _player.stop();
       await _player.setAudioSource(
         ja.AudioSource.uri(Uri.dataFromBytes(wav, mimeType: 'audio/wav')),

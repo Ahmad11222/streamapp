@@ -1,5 +1,7 @@
 import 'dart:io';
 import 'package:firebase_messaging/firebase_messaging.dart';
+import 'package:streamapp/pages/streamingSound.dart';
+import 'package:streamapp/pages/testaudio.dart';
 import '../auth/AppUser.dart';
 import 'global/globalConfig.dart';
 import 'mainPages/homePage.dart';
@@ -164,7 +166,7 @@ class _MyAppState extends State<MyApp> {
           secondary: mySubColor,
         ),
       ),
-      home: myNav(navChoice: homePage()),
+      home: myNav(navChoice: GeminiLiveDuplexPage()),
 
       // SplashScreen(
       //   changeLocale: null,
